@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Branch/Wire -->
+    <path
+        android:pathData="M6.5,14.5 L17.5,14.5"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round" />
+    <!-- Bird Body Outline -->
+    <path
+        android:pathData="M8.5,17.5 L10.5,14.5 L15,7 C15.5,6.2 16.5,6.2 17,7 L19,9.5 C19.3,10 18.5,11.2 17.5,12.2 L15.5,14 L12.5,14.5 M10.5,14.5 L12.5,14.5 M12.5,14.5 L9.5,17.5"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="1.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <!-- Eye -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M16.2,8.2m-0.5,0a0.5,0.5 0,1 1,1 0a0.5,0.5 0,1 1,-1 0" />
+</vector>

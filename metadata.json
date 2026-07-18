@@ -1,0 +1,6 @@
+{
+  "name": "Blanket",
+  "description": "An elegant ambient noise player for Android, procedural audio generators, and sleep timer support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

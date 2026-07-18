@@ -1,0 +1,544 @@
+package com.example.ui
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.ServiceConnection
+import android.net.Uri
+import android.os.IBinder
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.example.R
+import com.example.audio.BlanketAudioService
+import com.example.audio.SoundType
+import com.example.data.Preset
+import com.example.data.PresetRepository
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+
+data class SoundItem(
+    val id: String,
+    val label: String,
+    val iconName: String,
+    val isCustom: Boolean = false,
+    val filePath: String? = null,
+    val rawResId: Int? = null
+)
+
+val BuiltInSounds = listOf(
+    SoundItem("rain", "Yağmur", "umbrella", rawResId = R.raw.rain),
+    SoundItem("storm", "Fırtına", "thunderstorm", rawResId = R.raw.storm),
+    SoundItem("wind", "Rüzgar", "air", rawResId = R.raw.wind),
+    SoundItem("waves", "Dalgalar", "tsunami", rawResId = R.raw.waves),
+    SoundItem("stream", "Dere", "waves", rawResId = R.raw.stream),
+    SoundItem("fireplace", "Şömine", "local_fire_department", rawResId = R.raw.fireplace),
+    SoundItem("birds", "Kuşlar", "flutter_dash", rawResId = R.raw.birds),
+    SoundItem("crickets", "Yaz Gecesi", "nights_stay", rawResId = R.raw.summer_night),
+    SoundItem("train", "Tren", "train", rawResId = R.raw.train),
+    SoundItem("coffee_shop", "Kafe", "local_cafe", rawResId = R.raw.coffee_shop),
+    SoundItem("white_noise", "Beyaz Gürültü", "blur_on", rawResId = R.raw.white_noise),
+    SoundItem("pink_noise", "Pembe Gürültü", "grain", rawResId = R.raw.pink_noise),
+    SoundItem("boat", "Tekne", "sailing", rawResId = R.raw.boat),
+    SoundItem("city", "Şehir", "location_city", rawResId = R.raw.city)
+)
+
+class BlanketViewModel(
+    private val applicationContext: Context,
+    private val repository: PresetRepository
+) : ViewModel() {
+    private val TAG = "BlanketViewModel"
+
+    // Service Reference
+    private var boundService: BlanketAudioService? = null
+    private var isStateRestored = false
+    private val _isServiceConnected = MutableStateFlow(false)
+    val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()
+
+    // Real-time Playback State
+    private val _isPlaying = MutableStateFlow(false)
+    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
+
+    // Current volumes from engine (key is soundId)
+    private val _currentVolumes = MutableStateFlow<Map<String, Float>>(emptyMap())
+    val currentVolumes: StateFlow<Map<String, Float>> = _currentVolumes.asStateFlow()
+
+    // Currently active/toggled sound IDs
+    private val _activeSoundIds = MutableStateFlow<Set<String>>(emptySet())
+    val activeSoundIds: StateFlow<Set<String>> = _activeSoundIds.asStateFlow()
+
+    // High-Precision / Fine-Tuning State
+    private val _highPrecisionSoundId = MutableStateFlow<String?>(null)
+    val highPrecisionSoundId: StateFlow<String?> = _highPrecisionSoundId.asStateFlow()
+
+    // Available sounds list (built-in + scanned custom sounds)
+    private val _soundItems = MutableStateFlow<List<SoundItem>>(BuiltInSounds)
+    val soundItems: StateFlow<List<SoundItem>> = _soundItems.asStateFlow()
+
+    // Store the last non-zero volume for each sound ID
+    private val lastVolumes = ConcurrentHashMap<String, Float>().apply {
+        BuiltInSounds.forEach { this[it.id] = 0.5f }
+    }
+
+    // Sleep Timer States
+    private val _sleepTimerRemainingMs = MutableStateFlow(0L)
+    val sleepTimerRemainingMs: StateFlow<Long> = _sleepTimerRemainingMs.asStateFlow()
+
+    private val _sleepTimerTotalMs = MutableStateFlow(0L)
+    val sleepTimerTotalMs: StateFlow<Long> = _sleepTimerTotalMs.asStateFlow()
+
+    // Presets from DB
+    val presets: StateFlow<List<Preset>> = repository.allPresets
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    init {
+        loadCustomSounds()
+    }
+
+    fun loadCustomSounds(onComplete: (() -> Unit)? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val customSoundsDir = File(applicationContext.filesDir, "custom_sounds")
+                if (!customSoundsDir.exists()) {
+                    customSoundsDir.mkdirs()
+                }
+                val files = customSoundsDir.listFiles() ?: emptyArray()
+                val customItems = files.map { file ->
+                    val baseName = file.nameWithoutExtension
+                    val cleanLabel = baseName.replace("_", " ")
+                        .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                    val soundId = "custom_${baseName.lowercase()}"
+                    
+                    lastVolumes.putIfAbsent(soundId, 0.5f)
+                    
+                    SoundItem(
+                        id = soundId,
+                        label = cleanLabel,
+                        iconName = "music_note",
+                        isCustom = true,
+                        filePath = file.absolutePath
+                    )
+                }
+                _soundItems.value = BuiltInSounds + customItems
+                
+                viewModelScope.launch(Dispatchers.Main) {
+                    onComplete?.invoke()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to scan custom sounds", e)
+            }
+        }
+    }
+
+    // Service Connection Implementation
+    val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            Log.d(TAG, "onServiceConnected")
+            val binder = service as? BlanketAudioService.LocalBinder
+            if (binder != null) {
+                boundService = binder.getService()
+                _isServiceConnected.value = true
+
+                // Attach real-time listener
+                boundService?.setListener(object : BlanketAudioService.Listener {
+                    override fun onStateChanged(isPlaying: Boolean, volumes: Map<String, Float>) {
+                        _isPlaying.value = isPlaying
+                        
+                        // Map volumes of all registered sound items (default 0f if not playing)
+                        val fullMap = _soundItems.value.associate { item ->
+                            item.id to (volumes[item.id] ?: 0f)
+                        }
+                        _currentVolumes.value = fullMap
+                        
+                        // Sync activeSoundIds: if it has volume > 0f, it is definitely active
+                        val activeFromVolume = volumes.filter { it.value > 0f }.keys
+                        if (activeFromVolume.isNotEmpty()) {
+                            val mergedActive = _activeSoundIds.value.toMutableSet().apply {
+                                addAll(activeFromVolume)
+                            }
+                            _activeSoundIds.value = mergedActive
+                        }
+
+                        // Save playback state whenever it changes
+                        savePlaybackState()
+                    }
+
+                    override fun onTimerTick(remainingMs: Long, totalMs: Long) {
+                        _sleepTimerRemainingMs.value = remainingMs
+                        _sleepTimerTotalMs.value = totalMs
+                    }
+                })
+
+                // Reload custom sounds and then restore state
+                loadCustomSounds {
+                    restorePlaybackState()
+                }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            Log.d(TAG, "onServiceDisconnected")
+            boundService?.setListener(null)
+            boundService = null
+            _isServiceConnected.value = false
+            isStateRestored = false // Reset for next connection
+        }
+    }
+
+    private fun savePlaybackState() {
+        if (!isStateRestored) {
+            Log.d(TAG, "savePlaybackState skipped - state not restored yet")
+            return
+        }
+        val sharedPrefs = applicationContext.getSharedPreferences("blanket_prefs", Context.MODE_PRIVATE)
+        val volumes = _currentVolumes.value
+        val activeIds = _activeSoundIds.value
+        val activeVolumesString = activeIds
+            .map { id -> "$id:${volumes[id] ?: 0f}" }
+            .joinToString(",")
+
+        sharedPrefs.edit()
+            .putString("last_active_volumes", activeVolumesString)
+            .putBoolean("last_is_playing", _isPlaying.value)
+            .apply()
+        Log.d(TAG, "savePlaybackState successful: isPlaying=${_isPlaying.value}, volumes=$activeVolumesString")
+    }
+
+    private fun restorePlaybackState() {
+        val service = boundService ?: return
+        val sharedPrefs = applicationContext.getSharedPreferences("blanket_prefs", Context.MODE_PRIVATE)
+        val savedActiveVolumes = sharedPrefs.getString("last_active_volumes", null)
+        val savedIsPlaying = sharedPrefs.getBoolean("last_is_playing", false)
+
+        val newActiveIds = mutableSetOf<String>()
+        if (!savedActiveVolumes.isNullOrEmpty()) {
+            savedActiveVolumes.split(",").forEach { pair ->
+                val parts = pair.split(":")
+                if (parts.size == 2) {
+                    val id = parts[0]
+                    val vol = parts[1].toFloatOrNull() ?: 0f
+                    newActiveIds.add(id)
+                    lastVolumes[id] = vol
+
+                    val sound = _soundItems.value.find { it.id == id }
+                    if (sound != null) {
+                        service.audioEngine.setVolume(
+                            soundId = sound.id,
+                            volume = vol,
+                            isCustom = sound.isCustom,
+                            filePath = sound.filePath,
+                            rawResId = sound.rawResId
+                        )
+                    }
+                }
+            }
+        }
+
+        _activeSoundIds.value = newActiveIds
+        isStateRestored = true // State has been successfully loaded into the engine and active lists
+        service.updateVolumesAndActiveState(immediate = true)
+
+        if (savedIsPlaying && newActiveIds.isNotEmpty()) {
+            service.startPlayback()
+        }
+    }
+
+    // Playback Controls
+    fun togglePlayPause() {
+        val service = boundService ?: return
+        if (_isPlaying.value) {
+            service.pausePlayback()
+        } else {
+            service.startPlayback()
+        }
+    }
+
+    fun stopAll() {
+        val service = boundService ?: return
+        val updatedVolumes = _currentVolumes.value.toMutableMap()
+        _soundItems.value.forEach { sound ->
+            service.audioEngine.setVolume(sound.id, 0f)
+            updatedVolumes[sound.id] = 0f
+        }
+        _currentVolumes.value = updatedVolumes
+        _activeSoundIds.value = emptySet()
+        service.updateVolumesAndActiveState(immediate = true)
+        service.pausePlayback()
+    }
+
+    fun setVolume(soundId: String, volume: Float, immediate: Boolean = false) {
+        val service = boundService ?: return
+        val sound = _soundItems.value.find { it.id == soundId } ?: return
+
+        service.audioEngine.setVolume(
+            soundId = sound.id,
+            volume = volume,
+            isCustom = sound.isCustom,
+            filePath = sound.filePath,
+            rawResId = sound.rawResId
+        )
+
+        // Instantly update ViewModel state maps so UI reacts in real-time without latency
+        val updatedVolumes = _currentVolumes.value.toMutableMap()
+        updatedVolumes[soundId] = volume
+        _currentVolumes.value = updatedVolumes
+
+        val currentActive = _activeSoundIds.value.toMutableSet()
+        if (volume > 0f && !currentActive.contains(soundId)) {
+            currentActive.add(soundId)
+            _activeSoundIds.value = currentActive
+        } else if (volume == 0f && currentActive.contains(soundId)) {
+            currentActive.remove(soundId)
+            _activeSoundIds.value = currentActive
+        }
+
+        service.updateVolumesAndActiveState(immediate)
+
+        if (volume > 0f) {
+            lastVolumes[soundId] = volume
+        }
+
+        // If master is paused and volume is > 0f, start playback automatically
+        if (!_isPlaying.value && volume > 0f) {
+            service.startPlayback()
+        }
+    }
+
+    fun toggleSoundActive(soundId: String) {
+        val service = boundService ?: return
+        val currentActive = _activeSoundIds.value.toMutableSet()
+
+        if (currentActive.contains(soundId)) {
+            // Deactivate
+            currentActive.remove(soundId)
+            _activeSoundIds.value = currentActive
+
+            // Stop in the engine
+            service.audioEngine.setVolume(soundId, 0f)
+            
+            // Instantly update VM volume state too
+            val updatedVolumes = _currentVolumes.value.toMutableMap()
+            updatedVolumes[soundId] = 0f
+            _currentVolumes.value = updatedVolumes
+
+            service.updateVolumesAndActiveState(immediate = true)
+        } else {
+            // Activate
+            currentActive.add(soundId)
+            _activeSoundIds.value = currentActive
+
+            // Restore last volume
+            val restoreVolume = lastVolumes[soundId] ?: 0.5f
+            val sound = _soundItems.value.find { it.id == soundId } ?: return
+            
+            service.audioEngine.setVolume(
+                soundId = sound.id,
+                volume = restoreVolume,
+                isCustom = sound.isCustom,
+                filePath = sound.filePath,
+                rawResId = sound.rawResId
+            )
+
+            // Instantly update VM volume state too
+            val updatedVolumes = _currentVolumes.value.toMutableMap()
+            updatedVolumes[soundId] = restoreVolume
+            _currentVolumes.value = updatedVolumes
+
+            service.updateVolumesAndActiveState(immediate = true)
+
+            // Auto-play master if paused
+            if (!_isPlaying.value) {
+                service.startPlayback()
+            }
+        }
+    }
+
+    fun setHighPrecisionMode(soundId: String, enabled: Boolean) {
+        _highPrecisionSoundId.value = if (enabled) soundId else null
+    }
+
+    fun importSound(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val originalName = getFileNameFromUri(applicationContext, uri)
+                val extension = originalName.substringAfterLast('.', "").lowercase()
+                val validExtensions = setOf("ogg", "opus", "mp3", "m4a")
+                if (extension !in validExtensions) {
+                    Log.e(TAG, "Unsupported file format: $extension")
+                    return@launch
+                }
+
+                val customSoundsDir = File(applicationContext.filesDir, "custom_sounds")
+                if (!customSoundsDir.exists()) {
+                    customSoundsDir.mkdirs()
+                }
+
+                // Clean name for storage
+                val cleanName = originalName.substringBeforeLast('.')
+                    .replace(Regex("[^a-zA-Z0-9]"), "_") + "." + extension
+                val destFile = File(customSoundsDir, cleanName)
+
+                applicationContext.contentResolver.openInputStream(uri)?.use { inputStream ->
+                    destFile.outputStream().use { outputStream ->
+                        inputStream.copyTo(outputStream)
+                    }
+                }
+
+                val newSoundId = "custom_${cleanName.substringBeforeLast('.').lowercase()}"
+                lastVolumes[newSoundId] = 0.5f
+
+                // Reload custom list
+                loadCustomSounds()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to import sound", e)
+            }
+        }
+    }
+
+    fun deleteCustomSound(soundItem: SoundItem) {
+        // 1. Deactivate sound if currently active
+        if (_activeSoundIds.value.contains(soundItem.id)) {
+            toggleSoundActive(soundItem.id)
+        }
+        
+        // Remove from memory volumes and cache
+        lastVolumes.remove(soundItem.id)
+
+        // 2. Delete physical file
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                soundItem.filePath?.let { path ->
+                    val file = File(path)
+                    if (file.exists()) {
+                        file.delete()
+                    }
+                }
+                // Reload list to refresh soundboard state
+                loadCustomSounds()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to delete custom sound", e)
+            }
+        }
+    }
+
+
+    private fun getFileNameFromUri(context: Context, uri: Uri): String {
+        var name = ""
+        val cursor = context.contentResolver.query(uri, null, null, null, null)
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val nameIndex = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (nameIndex != -1) {
+                    name = it.getString(nameIndex)
+                }
+            }
+        }
+        if (name.isEmpty()) {
+            name = uri.path?.substringAfterLast('/') ?: "custom_sound_${System.currentTimeMillis()}.mp3"
+        }
+        return name
+    }
+
+    // Sleep Timer Controls
+    fun startSleepTimer(minutes: Int) {
+        val service = boundService ?: return
+        val durationMs = minutes * 60 * 1000L
+        service.startSleepTimer(durationMs)
+    }
+
+    fun cancelSleepTimer() {
+        val service = boundService ?: return
+        service.cancelSleepTimer()
+    }
+
+    // Preset Controls
+    fun savePreset(name: String) {
+        viewModelScope.launch {
+            val volumes = _currentVolumes.value
+            val activeVolumesString = _activeSoundIds.value
+                .map { id -> "$id:${volumes[id] ?: 0f}" }
+                .joinToString(",")
+
+            if (activeVolumesString.isNotEmpty() && name.isNotBlank()) {
+                val newPreset = Preset(name = name, soundVolumes = activeVolumesString)
+                repository.insert(newPreset)
+            }
+        }
+    }
+
+    fun loadPreset(preset: Preset) {
+        val service = boundService ?: return
+
+        // 1. Reset all sound volumes in the engine and VM local state
+        val updatedVolumes = _soundItems.value.associate { it.id to 0f }.toMutableMap()
+        _soundItems.value.forEach { service.audioEngine.setVolume(it.id, 0f) }
+        val newActiveIds = mutableSetOf<String>()
+
+        // 2. Parse and set new volumes from the preset
+        if (preset.soundVolumes.isNotEmpty()) {
+            preset.soundVolumes.split(",").forEach { pair ->
+                val parts = pair.split(":")
+                if (parts.size == 2) {
+                    val id = parts[0]
+                    val vol = parts[1].toFloatOrNull() ?: 0f
+                    if (vol > 0f) {
+                        newActiveIds.add(id)
+                        lastVolumes[id] = vol
+                        updatedVolumes[id] = vol
+
+                        val sound = _soundItems.value.find { it.id == id }
+                        if (sound != null) {
+                            service.audioEngine.setVolume(
+                                soundId = sound.id,
+                                volume = vol,
+                                isCustom = sound.isCustom,
+                                filePath = sound.filePath,
+                                rawResId = sound.rawResId
+                            )
+                        }
+                    }
+                }
+              }
+          }
+
+        _currentVolumes.value = updatedVolumes
+        _activeSoundIds.value = newActiveIds
+        service.updateVolumesAndActiveState(immediate = true)
+        service.startPlayback()
+    }
+
+    fun deletePreset(preset: Preset) {
+        viewModelScope.launch {
+            repository.delete(preset)
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        boundService?.setListener(null)
+    }
+}
+
+class BlanketViewModelFactory(
+    private val applicationContext: Context,
+    private val repository: PresetRepository
+) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(BlanketViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return BlanketViewModel(applicationContext, repository) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
