@@ -466,35 +466,6 @@ class BlanketViewModel(
                     return@launch
                 }
 
-                // 1. File Size Check (20 MB limit)
-                val fileSize = try {
-                    applicationContext.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
-                } catch (e: Exception) {
-                    0L
-                }
-                if (fileSize > 20 * 1024 * 1024L) {
-                    _userMessage.value = "Dosya boyutu çok büyük (Maksimum 20 MB yüklenebilir)."
-                    return@launch
-                }
-
-                // 2. Audio Duration Check via MediaMetadataRetriever (10 Minutes limit)
-                val retriever = android.media.MediaMetadataRetriever()
-                try {
-                    retriever.setDataSource(applicationContext, uri)
-                    val durationStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    val durationMs = durationStr?.toLongOrNull() ?: 0L
-                    if (durationMs > 10 * 60 * 1000L) {
-                        _userMessage.value = "Ses süresi çok uzun (Maksimum 10 dakika yüklenebilir)."
-                        return@launch
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to read audio duration metadata", e)
-                } finally {
-                    try {
-                        retriever.release()
-                    } catch (_: Exception) {}
-                }
-
                 val customSoundsDir = File(applicationContext.filesDir, "custom_sounds")
                 if (!customSoundsDir.exists()) {
                     customSoundsDir.mkdirs()
