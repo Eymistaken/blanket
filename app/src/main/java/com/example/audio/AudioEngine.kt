@@ -36,7 +36,10 @@ enum class SoundType(val id: String, val label: String, val iconName: String) {
     CITY("city", "Şehir", "location_city")
 }
 
-class AudioEngine(private val context: Context) {
+class AudioEngine(
+    private val context: Context,
+    private val playerFactory: ((context: Context, soundId: String) -> ExoPlayer)? = null
+) {
     private val TAG = "AudioEngine"
     
     // Background thread dedicated to running all ExoPlayer instances and updates
@@ -193,20 +196,22 @@ class AudioEngine(private val context: Context) {
 
     private fun getOrCreatePlayer(soundId: String): ExoPlayer {
         return players.getOrPut(soundId) {
-            val meta = soundMetadata[soundId] ?: throw IllegalArgumentException("No metadata registered for sound: $soundId")
-            val rawUri = if (meta.isCustom && meta.filePath != null) {
-                Uri.fromFile(File(meta.filePath))
-            } else {
-                Uri.parse("android.resource://${context.packageName}/${meta.rawResId}")
-            }
-            Log.d(TAG, "Creating ExoPlayer lazily for sound: $soundId")
-            ExoPlayer.Builder(context)
-                .setPlaybackLooper(audioThread.looper)
-                .build().apply {
-                    setMediaItem(MediaItem.fromUri(rawUri))
-                    repeatMode = Player.REPEAT_MODE_ALL
-                    prepare()
+            playerFactory?.invoke(context, soundId) ?: run {
+                val meta = soundMetadata[soundId] ?: throw IllegalArgumentException("No metadata registered for sound: $soundId")
+                val rawUri = if (meta.isCustom && meta.filePath != null) {
+                    Uri.fromFile(File(meta.filePath))
+                } else {
+                    Uri.parse("android.resource://${context.packageName}/${meta.rawResId}")
                 }
+                Log.d(TAG, "Creating ExoPlayer lazily for sound: $soundId")
+                ExoPlayer.Builder(context)
+                    .setPlaybackLooper(audioThread.looper)
+                    .build().apply {
+                        setMediaItem(MediaItem.fromUri(rawUri))
+                        repeatMode = Player.REPEAT_MODE_ALL
+                        prepare()
+                    }
+            }
         }
     }
 

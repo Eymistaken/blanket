@@ -1,5 +1,6 @@
 package com.example.audio
 
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertFalse
@@ -7,6 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.mockito.Mockito.mock
 import org.robolectric.annotation.Config
 
 @RunWith(AndroidJUnit4::class)
@@ -17,7 +19,10 @@ class AudioEngineTest {
 
     @Before
     fun setUp() {
-        audioEngine = AudioEngine(ApplicationProvider.getApplicationContext())
+        audioEngine = AudioEngine(
+            ApplicationProvider.getApplicationContext(),
+            playerFactory = { _, _ -> mock(ExoPlayer::class.java) }
+        )
     }
 
     @Test
