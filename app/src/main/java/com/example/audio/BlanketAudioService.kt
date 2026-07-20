@@ -210,23 +210,27 @@ class BlanketAudioService : Service() {
     fun updateVolumesAndActiveState(immediate: Boolean = false) {
         if (immediate) {
             notificationUpdateJob?.cancel()
-            if (isPlaying) {
-                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                try {
-                    notificationManager.notify(NOTIFICATION_ID, buildNotification())
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to update notification", e)
+            serviceScope.launch(Dispatchers.Default) {
+                if (isPlaying) {
+                    val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    try {
+                        val notification = buildNotification()
+                        notificationManager.notify(NOTIFICATION_ID, notification)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to update notification", e)
+                    }
                 }
+                notifyStateChange()
             }
-            notifyStateChange()
         } else {
             notificationUpdateJob?.cancel()
-            notificationUpdateJob = serviceScope.launch {
+            notificationUpdateJob = serviceScope.launch(Dispatchers.Default) {
                 delay(250L) // Wait for 250ms of user inactivity before posting notification updates
                 if (isPlaying) {
                     val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                     try {
-                        notificationManager.notify(NOTIFICATION_ID, buildNotification())
+                        val notification = buildNotification()
+                        notificationManager.notify(NOTIFICATION_ID, notification)
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to update notification", e)
                     }

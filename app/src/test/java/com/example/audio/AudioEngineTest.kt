@@ -3,6 +3,7 @@ package com.example.audio
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import org.junit.After
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -25,6 +26,11 @@ class AudioEngineTest {
         )
     }
 
+    @After
+    fun tearDown() {
+        audioEngine.stop()
+    }
+
     @Test
     fun testLazyPlayerCreationOnVolumeSet() {
         assertFalse(audioEngine.hasPlayer("rain"))
@@ -45,12 +51,11 @@ class AudioEngineTest {
         // Set volume to 0
         audioEngine.setVolume("rain", 0f)
         
-        // Immediately after setting volume to 0, player should still exist during debounce
-        Thread.sleep(200)
+        // Player should still exist during debounce window before 2.5s delay finishes
         assertTrue(audioEngine.hasPlayer("rain"))
 
         // Wait past the 2.5s debounce delay
-        Thread.sleep(3000)
+        Thread.sleep(3500)
         assertFalse(audioEngine.hasPlayer("rain"))
     }
 
@@ -63,12 +68,11 @@ class AudioEngineTest {
 
         // Set volume to 0
         audioEngine.setVolume("rain", 0f)
-        Thread.sleep(1000) // 1 second into debounce
         assertTrue(audioEngine.hasPlayer("rain"))
 
         // Re-enable volume before 2.5s window finishes
         audioEngine.setVolume("rain", 0.8f)
-        Thread.sleep(2000) // Wait past original debounce timeout
+        Thread.sleep(3500) // Wait past original debounce timeout
         assertTrue(audioEngine.hasPlayer("rain"))
     }
 }

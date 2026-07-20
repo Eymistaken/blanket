@@ -49,6 +49,7 @@ class AudioEngine(
     private val engineDispatcher = handler.asCoroutineDispatcher("AudioEngineDispatcher")
     private val engineScope = CoroutineScope(engineDispatcher + engineJob)
 
+    @Volatile
     private var isPlaying = false
 
     // Store sound volumes (0.0f to 1.0f). Key is soundId.

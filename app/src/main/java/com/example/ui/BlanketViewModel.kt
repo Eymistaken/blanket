@@ -15,10 +15,12 @@ import com.example.audio.SoundType
 import com.example.data.Preset
 import com.example.data.PresetRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
@@ -31,6 +33,12 @@ data class SoundItem(
     val isCustom: Boolean = false,
     val filePath: String? = null,
     val rawResId: Int? = null
+)
+
+private data class SoundVolumeIntent(
+    val soundId: String,
+    val volume: Float,
+    val immediate: Boolean
 )
 
 val BuiltInSounds = listOf(
@@ -82,6 +90,9 @@ class BlanketViewModel(
     private val _soundItems = MutableStateFlow<List<SoundItem>>(BuiltInSounds)
     val soundItems: StateFlow<List<SoundItem>> = _soundItems.asStateFlow()
 
+    // Volume intent flow for throttling/sampling volume changes during drag gestures
+    private val volumeIntentFlow = MutableSharedFlow<SoundVolumeIntent>(extraBufferCapacity = 128)
+
     // Store the last non-zero volume for each sound ID
     private val lastVolumes = ConcurrentHashMap<String, Float>().apply {
         BuiltInSounds.forEach { this[it.id] = 0.5f }
@@ -104,6 +115,18 @@ class BlanketViewModel(
 
     init {
         loadCustomSounds()
+        setupVolumeThrottling()
+    }
+
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    private fun setupVolumeThrottling() {
+        viewModelScope.launch(Dispatchers.Default) {
+            volumeIntentFlow
+                .sample(120L)
+                .collect { intent ->
+                    applyVolumeInternal(intent.soundId, intent.volume, immediate = false)
+                }
+        }
     }
 
     fun loadCustomSounds(onComplete: (() -> Unit)? = null) {
@@ -277,7 +300,7 @@ class BlanketViewModel(
         service.pausePlayback()
     }
 
-    fun setVolume(soundId: String, volume: Float, immediate: Boolean = false) {
+    private fun applyVolumeInternal(soundId: String, volume: Float, immediate: Boolean) {
         val service = boundService ?: return
         val sound = _soundItems.value.find { it.id == soundId } ?: return
 
@@ -289,7 +312,6 @@ class BlanketViewModel(
             rawResId = sound.rawResId
         )
 
-        // Instantly update ViewModel state maps so UI reacts in real-time without latency
         val updatedVolumes = _currentVolumes.value.toMutableMap()
         updatedVolumes[soundId] = volume
         _currentVolumes.value = updatedVolumes
@@ -309,9 +331,18 @@ class BlanketViewModel(
             lastVolumes[soundId] = volume
         }
 
-        // If master is paused and volume is > 0f, start playback automatically
         if (!_isPlaying.value && volume > 0f) {
             service.startPlayback()
+        }
+    }
+
+    fun setVolume(soundId: String, volume: Float, immediate: Boolean = false) {
+        if (immediate) {
+            viewModelScope.launch(Dispatchers.Default) {
+                applyVolumeInternal(soundId, volume, immediate = true)
+            }
+        } else {
+            volumeIntentFlow.tryEmit(SoundVolumeIntent(soundId, volume, immediate = false))
         }
     }
 
