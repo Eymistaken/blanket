@@ -214,14 +214,9 @@ class BlanketViewModel(
                         }
                         _currentVolumes.value = fullMap
                         
-                        // Sync activeSoundIds: if it has volume > 0f, it is definitely active
-                        val activeFromVolume = volumes.filter { it.value > 0f }.keys
-                        if (activeFromVolume.isNotEmpty()) {
-                            val mergedActive = _activeSoundIds.value.toMutableSet().apply {
-                                addAll(activeFromVolume)
-                            }
-                            _activeSoundIds.value = mergedActive
-                        }
+                        // Sync activeSoundIds: exact set of sounds with volume > 0f (symmetrical add and remove)
+                        val activeFromVolume = volumes.filter { it.value > 0f }.keys.toSet()
+                        _activeSoundIds.value = activeFromVolume
 
                         // Save playback state whenever it changes
                         savePlaybackState()
@@ -318,16 +313,15 @@ class BlanketViewModel(
     }
 
     fun stopAll() {
-        val service = boundService ?: return
-        val updatedVolumes = _currentVolumes.value.toMutableMap()
-        _soundItems.value.forEach { sound ->
-            service.audioEngine.setVolume(sound.id, 0f)
-            updatedVolumes[sound.id] = 0f
-        }
-        _currentVolumes.value = updatedVolumes
+        val service = boundService
+        val fullZeroMap = _soundItems.value.associate { it.id to 0f }
+        _currentVolumes.value = fullZeroMap
         _activeSoundIds.value = emptySet()
-        service.updateVolumesAndActiveState(immediate = true)
-        service.pausePlayback()
+        _isPlaying.value = false
+
+        if (service != null) {
+            service.stopPlayback()
+        }
     }
 
     private fun applyVolumeInternal(soundId: String, volume: Float, immediate: Boolean) {

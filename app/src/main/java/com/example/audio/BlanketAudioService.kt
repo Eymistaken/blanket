@@ -200,9 +200,9 @@ class BlanketAudioService : Service() {
         audioEngine.stop()
         releaseAudioFocus()
         cancelSleepTimer()
+        notifyStateChange(forcedVolumes = emptyMap())
         stopForeground(true)
         stopSelf()
-        notifyStateChange()
     }
 
     private var notificationUpdateJob: Job? = null
@@ -336,13 +336,14 @@ class BlanketAudioService : Service() {
         return builder.build()
     }
 
-    private fun notifyStateChange() {
-        serviceListener?.onStateChanged(isPlaying, audioEngine.getActiveVolumes())
+    private fun notifyStateChange(forcedVolumes: Map<String, Float>? = null) {
+        val volumes = forcedVolumes ?: audioEngine.getActiveVolumes()
+        serviceListener?.onStateChanged(isPlaying, volumes)
         
         val intent = Intent("com.example.blanket.STATE_CHANGED").apply {
             putExtra("EXTRA_IS_PLAYING", isPlaying)
             val volumesBundle = android.os.Bundle()
-            audioEngine.getActiveVolumes().forEach { (id, vol) ->
+            volumes.forEach { (id, vol) ->
                 volumesBundle.putFloat(id, vol)
             }
             putExtra("EXTRA_VOLUMES", volumesBundle)
