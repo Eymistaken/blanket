@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -40,14 +41,8 @@ class MainActivity : ComponentActivity() {
         val factory = BlanketViewModelFactory(applicationContext, repository)
         viewModel = ViewModelProvider(this, factory)[BlanketViewModel::class.java]
 
-        // 3. Start & Bind the Audio Service so that it stays active in the background
-        val serviceIntent = Intent(this, BlanketAudioService::class.java)
-        try {
-            startService(serviceIntent)
-        } catch (e: Exception) {
-            // Under background execution restrictions starting service can sometimes fail; binding handles fallback.
-        }
-        bindService(serviceIntent, viewModel.serviceConnection, Context.BIND_AUTO_CREATE)
+        // 3. Start & Bind the Audio Service with error handling
+        bindAudioService()
 
         // 4. Request notification permissions dynamically on Android 13+ (API 33+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -62,8 +57,49 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MyApplicationTheme {
-                BlanketApp(viewModel = viewModel)
+                BlanketApp(
+                    viewModel = viewModel,
+                    onRetryServiceBind = { bindAudioService() }
+                )
             }
+        }
+    }
+
+    private fun bindAudioService() {
+        val serviceIntent = Intent(this, BlanketAudioService::class.java)
+        try {
+            startService(serviceIntent)
+        } catch (e: Exception) {
+            if (BuildConfig.DEBUG) {
+                Log.d("MainActivity", "startService failed, falling back to bindService", e)
+            }
+        }
+
+        try {
+            val bound = bindService(serviceIntent, viewModel.serviceConnection, Context.BIND_AUTO_CREATE)
+            if (!bound) {
+                if (BuildConfig.DEBUG) {
+                    Log.d("MainActivity", "bindService returned false - service connection failed")
+                }
+                viewModel.setServiceBindError("Ses servisi başlatılamadı. Kontroller çalışmayabilir.")
+            } else {
+                viewModel.clearServiceBindError()
+            }
+        } catch (e: SecurityException) {
+            if (BuildConfig.DEBUG) {
+                Log.d("MainActivity", "SecurityException during bindService", e)
+            }
+            viewModel.setServiceBindError("Güvenlik engeli nedeniyle ses servisi başlatılamadı.")
+        } catch (e: IllegalStateException) {
+            if (BuildConfig.DEBUG) {
+                Log.d("MainActivity", "IllegalStateException during bindService", e)
+            }
+            viewModel.setServiceBindError("Uygulama durumundan dolayı ses servisi başlatılamadı.")
+        } catch (e: Exception) {
+            if (BuildConfig.DEBUG) {
+                Log.d("MainActivity", "Exception during bindService: ${e.localizedMessage}", e)
+            }
+            viewModel.setServiceBindError("Ses servisine bağlanırken hata oluştu.")
         }
     }
 

@@ -89,6 +89,18 @@ class BlanketViewModel(
     private val _activeSoundIds = MutableStateFlow<Set<String>>(emptySet())
     val activeSoundIds: StateFlow<Set<String>> = _activeSoundIds.asStateFlow()
 
+    // Service Binding Error State
+    private val _serviceBindError = MutableStateFlow<String?>(null)
+    val serviceBindError: StateFlow<String?> = _serviceBindError.asStateFlow()
+
+    fun setServiceBindError(error: String?) {
+        _serviceBindError.value = error
+    }
+
+    fun clearServiceBindError() {
+        _serviceBindError.value = null
+    }
+
     // Scoped per-sound state flow cache to isolate recompositions
     private val soundStateFlowCache = ConcurrentHashMap<String, StateFlow<SoundState>>()
 
@@ -202,6 +214,7 @@ class BlanketViewModel(
             if (binder != null) {
                 boundService = binder.getService()
                 _isServiceConnected.value = true
+                clearServiceBindError()
 
                 // Attach real-time listener
                 boundService?.setListener(object : BlanketAudioService.Listener {

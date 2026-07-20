@@ -61,7 +61,10 @@ import kotlin.math.sin
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun BlanketApp(viewModel: BlanketViewModel) {
+fun BlanketApp(
+    viewModel: BlanketViewModel,
+    onRetryServiceBind: () -> Unit = {}
+) {
     val isPlaying by viewModel.isPlaying.collectAsStateWithLifecycle()
     val activeSoundIds by viewModel.activeSoundIds.collectAsStateWithLifecycle()
     val soundItems by viewModel.soundItems.collectAsStateWithLifecycle()
@@ -69,6 +72,23 @@ fun BlanketApp(viewModel: BlanketViewModel) {
     val sleepTimerTotalMs by viewModel.sleepTimerTotalMs.collectAsStateWithLifecycle()
     val presets by viewModel.presets.collectAsStateWithLifecycle()
     val highPrecisionSoundId by viewModel.highPrecisionSoundId.collectAsStateWithLifecycle()
+    val serviceBindError by viewModel.serviceBindError.collectAsStateWithLifecycle()
+
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(serviceBindError) {
+        val errorMsg = serviceBindError
+        if (errorMsg != null) {
+            val result = snackbarHostState.showSnackbar(
+                message = errorMsg,
+                actionLabel = "Tekrar Dene",
+                duration = SnackbarDuration.Indefinite
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                onRetryServiceBind()
+            }
+        }
+    }
 
     val activeSoundsCount = activeSoundIds.size
     val isHighLoad = activeSoundsCount >= 5
@@ -123,6 +143,7 @@ fun BlanketApp(viewModel: BlanketViewModel) {
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
+        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         topBar = {
             CenterAlignedTopAppBar(
                 title = {
