@@ -105,9 +105,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Unbind the service to prevent binder connection leaks
-        if (viewModel.isServiceConnected.value) {
+        try {
             unbindService(viewModel.serviceConnection)
+        } catch (e: IllegalArgumentException) {
+            if (BuildConfig.DEBUG) {
+                Log.d("MainActivity", "unbindService ignored (service was not registered or bound)", e)
+            }
+        } catch (e: Exception) {
+            if (BuildConfig.DEBUG) {
+                Log.d("MainActivity", "unbindService exception ignored", e)
+            }
         }
     }
 }
