@@ -73,6 +73,8 @@ fun BlanketApp(
     val presets by viewModel.presets.collectAsStateWithLifecycle()
     val highPrecisionSoundId by viewModel.highPrecisionSoundId.collectAsStateWithLifecycle()
     val serviceBindError by viewModel.serviceBindError.collectAsStateWithLifecycle()
+    val userMessage by viewModel.userMessage.collectAsStateWithLifecycle()
+    val pendingImport by viewModel.pendingImport.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -87,6 +89,17 @@ fun BlanketApp(
             if (result == SnackbarResult.ActionPerformed) {
                 onRetryServiceBind()
             }
+        }
+    }
+
+    LaunchedEffect(userMessage) {
+        val msg = userMessage
+        if (msg != null) {
+            snackbarHostState.showSnackbar(
+                message = msg,
+                duration = SnackbarDuration.Short
+            )
+            viewModel.clearUserMessage()
         }
     }
 
@@ -360,6 +373,41 @@ fun BlanketApp(
                     },
                     dialogBackground = MaterialTheme.colorScheme.surface,
                     accentColor = softTeal
+                )
+            }
+
+            // Option B Overwrite Confirmation Dialog for Custom Sound Import
+            if (pendingImport != null) {
+                AlertDialog(
+                    onDismissRequest = { viewModel.cancelImport() },
+                    title = {
+                        Text(
+                            text = "Dosya Zaten Var",
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    },
+                    text = {
+                        Text(
+                            text = "'${pendingImport?.cleanName}' isimli özel ses zaten mevcut. Üzerine yazmak istediğinize emin misiniz?",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { viewModel.confirmOverwriteImport() }) {
+                            Text(
+                                text = "Üzerine Yaz",
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { viewModel.cancelImport() }) {
+                            Text(text = "İptal")
+                        }
+                    },
+                    containerColor = MaterialTheme.colorScheme.surface
                 )
             }
 

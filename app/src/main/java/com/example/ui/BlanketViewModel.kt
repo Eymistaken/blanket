@@ -33,6 +33,13 @@ data class SoundState(
     val isActive: Boolean = false
 )
 
+data class PendingImport(
+    val uri: Uri,
+    val destFile: File,
+    val cleanName: String,
+    val newSoundId: String
+)
+
 data class SoundItem(
     val id: String,
     val label: String,
@@ -93,12 +100,24 @@ class BlanketViewModel(
     private val _serviceBindError = MutableStateFlow<String?>(null)
     val serviceBindError: StateFlow<String?> = _serviceBindError.asStateFlow()
 
+    // Pending Import Overwrite State (Option B)
+    private val _pendingImport = MutableStateFlow<PendingImport?>(null)
+    val pendingImport: StateFlow<PendingImport?> = _pendingImport.asStateFlow()
+
+    // General User Message State (for Snackbar feedback)
+    private val _userMessage = MutableStateFlow<String?>(null)
+    val userMessage: StateFlow<String?> = _userMessage.asStateFlow()
+
     fun setServiceBindError(error: String?) {
         _serviceBindError.value = error
     }
 
     fun clearServiceBindError() {
         _serviceBindError.value = null
+    }
+
+    fun clearUserMessage() {
+        _userMessage.value = null
     }
 
     // Scoped per-sound state flow cache to isolate recompositions
@@ -443,8 +462,37 @@ class BlanketViewModel(
                 val extension = originalName.substringAfterLast('.', "").lowercase()
                 val validExtensions = setOf("ogg", "opus", "mp3", "m4a")
                 if (extension !in validExtensions) {
-                    Log.e(TAG, "Unsupported file format: $extension")
+                    _userMessage.value = "Desteklenmeyen dosya biçimi: .$extension (Yalnızca OGG, MP3, M4A, OPUS yüklenebilir)."
                     return@launch
+                }
+
+                // 1. File Size Check (20 MB limit)
+                val fileSize = try {
+                    applicationContext.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+                } catch (e: Exception) {
+                    0L
+                }
+                if (fileSize > 20 * 1024 * 1024L) {
+                    _userMessage.value = "Dosya boyutu çok büyük (Maksimum 20 MB yüklenebilir)."
+                    return@launch
+                }
+
+                // 2. Audio Duration Check via MediaMetadataRetriever (10 Minutes limit)
+                val retriever = android.media.MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(applicationContext, uri)
+                    val durationStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    val durationMs = durationStr?.toLongOrNull() ?: 0L
+                    if (durationMs > 10 * 60 * 1000L) {
+                        _userMessage.value = "Ses süresi çok uzun (Maksimum 10 dakika yüklenebilir)."
+                        return@launch
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read audio duration metadata", e)
+                } finally {
+                    try {
+                        retriever.release()
+                    } catch (_: Exception) {}
                 }
 
                 val customSoundsDir = File(applicationContext.filesDir, "custom_sounds")
@@ -452,25 +500,51 @@ class BlanketViewModel(
                     customSoundsDir.mkdirs()
                 }
 
-                // Clean name for storage
-                val cleanName = originalName.substringBeforeLast('.')
-                    .replace(Regex("[^a-zA-Z0-9]"), "_") + "." + extension
+                val cleanBase = originalName.substringBeforeLast('.').replace(Regex("[^a-zA-Z0-9]"), "_")
+                val cleanName = "$cleanBase.$extension"
                 val destFile = File(customSoundsDir, cleanName)
+                val newSoundId = "custom_${cleanBase.lowercase()}"
 
-                applicationContext.contentResolver.openInputStream(uri)?.use { inputStream ->
-                    destFile.outputStream().use { outputStream ->
-                        inputStream.copyTo(outputStream)
-                    }
+                val pending = PendingImport(uri, destFile, cleanName, newSoundId)
+
+                if (destFile.exists()) {
+                    // Trigger Option B confirmation dialog
+                    _pendingImport.value = pending
+                } else {
+                    executeImport(pending)
                 }
-
-                val newSoundId = "custom_${cleanName.substringBeforeLast('.').lowercase()}"
-                lastVolumes[newSoundId] = 0.5f
-
-                // Reload custom list
-                loadCustomSounds()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to import sound", e)
+                _userMessage.value = "Ses içe aktarılırken bir hata oluştu."
             }
+        }
+    }
+
+    fun confirmOverwriteImport() {
+        val pending = _pendingImport.value ?: return
+        _pendingImport.value = null
+        viewModelScope.launch(Dispatchers.IO) {
+            executeImport(pending)
+        }
+    }
+
+    fun cancelImport() {
+        _pendingImport.value = null
+    }
+
+    private fun executeImport(pending: PendingImport) {
+        try {
+            applicationContext.contentResolver.openInputStream(pending.uri)?.use { inputStream ->
+                pending.destFile.outputStream().use { outputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+
+            lastVolumes[pending.newSoundId] = 0.5f
+            loadCustomSounds()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to execute import for ${pending.cleanName}", e)
+            _userMessage.value = "Dosya kaydedilirken hata oluştu."
         }
     }
 
