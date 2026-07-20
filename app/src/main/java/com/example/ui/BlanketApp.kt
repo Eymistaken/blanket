@@ -50,6 +50,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.audio.SoundType
 import com.example.data.Preset
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlin.math.roundToInt
@@ -185,14 +186,12 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                         modifier = Modifier.weight(1f)
                     ) {
                         items(soundItems, key = { it.id }) { soundItem ->
-                            val isActive = activeSoundIds.contains(soundItem.id)
-                            val volumeFlow = remember(soundItem.id) {
-                                viewModel.currentVolumes.map { it[soundItem.id] ?: 0f }.distinctUntilChanged()
+                            val soundStateFlow = remember(soundItem.id) {
+                                viewModel.soundState(soundItem.id)
                             }
                             SoundCard(
                                 soundItem = soundItem,
-                                isActive = isActive,
-                                volumeFlow = volumeFlow,
+                                soundStateFlow = soundStateFlow,
                                 onVolumeChange = { vol -> viewModel.setVolume(soundItem.id, vol) },
                                 onToggleActive = { viewModel.toggleSoundActive(soundItem.id) },
                                 activeColor = radiantIndigo,
@@ -332,7 +331,7 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                 val volumeFlow = remember(soundId) {
                     viewModel.currentVolumes.map { it[soundId] ?: 0f }.distinctUntilChanged()
                 }
-                val volume by volumeFlow.collectAsState(initial = 0f)
+                val volume by volumeFlow.collectAsState(initial = viewModel.currentVolumes.value[soundId] ?: 0f)
 
                 // Smooth spring progress inside overlay
                 val overlayAnimatedVolume by animateFloatAsState(
@@ -648,8 +647,7 @@ fun MasterControlPanel(
 @Composable
 fun SoundCard(
     soundItem: SoundItem,
-    isActive: Boolean,
-    volumeFlow: kotlinx.coroutines.flow.Flow<Float>,
+    soundStateFlow: StateFlow<SoundState>,
     onVolumeChange: (Float) -> Unit,
     onToggleActive: () -> Unit,
     activeColor: Color,
@@ -657,7 +655,9 @@ fun SoundCard(
     accentColor: Color,
     viewModel: BlanketViewModel
 ) {
-    val volume by volumeFlow.collectAsState(initial = 0f)
+    val soundState by soundStateFlow.collectAsStateWithLifecycle()
+    val volume = soundState.volume
+    val isActive = soundState.isActive
     var cardWidth by remember { mutableStateOf(1) }
 
     var localVolume by remember { mutableFloatStateOf(0f) }
@@ -729,16 +729,19 @@ fun SoundCard(
                     onDragStart = {
                         isDragging = true
                         // Auto-activate card if dragged while inactive
-                        if (!currentIsActive) {
-                            currentOnToggleActive()
+                        if (!viewModel.activeSoundIds.value.contains(soundItem.id)) {
+                            viewModel.toggleSoundActive(soundItem.id)
+                            localVolume = viewModel.currentVolumes.value[soundItem.id] ?: 0.5f
                         }
                         dragAccumulator = localVolume
                     },
                     onHorizontalDrag = { change, dragAmount ->
                         change.consume()
                         // Ensure card is active
-                        if (!currentIsActive) {
-                            currentOnToggleActive()
+                        if (!viewModel.activeSoundIds.value.contains(soundItem.id)) {
+                            viewModel.toggleSoundActive(soundItem.id)
+                            localVolume = viewModel.currentVolumes.value[soundItem.id] ?: 0.5f
+                            dragAccumulator = localVolume
                         }
                         
                         // Relative delta-based dragging with 1.8f sensitivity factor
@@ -782,8 +785,9 @@ fun SoundCard(
                 detectDragGesturesAfterLongPress(
                     onDragStart = {
                         isDragging = true
-                        if (!currentIsActive) {
-                            currentOnToggleActive()
+                        if (!viewModel.activeSoundIds.value.contains(soundItem.id)) {
+                            viewModel.toggleSoundActive(soundItem.id)
+                            localVolume = viewModel.currentVolumes.value[soundItem.id] ?: 0.5f
                         }
                         // Start high-precision mode
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)

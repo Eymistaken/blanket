@@ -20,11 +20,18 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+
+data class SoundState(
+    val volume: Float = 0f,
+    val isActive: Boolean = false
+)
 
 data class SoundItem(
     val id: String,
@@ -81,6 +88,29 @@ class BlanketViewModel(
     // Currently active/toggled sound IDs
     private val _activeSoundIds = MutableStateFlow<Set<String>>(emptySet())
     val activeSoundIds: StateFlow<Set<String>> = _activeSoundIds.asStateFlow()
+
+    // Scoped per-sound state flow cache to isolate recompositions
+    private val soundStateFlowCache = ConcurrentHashMap<String, StateFlow<SoundState>>()
+
+    fun soundState(id: String): StateFlow<SoundState> {
+        return soundStateFlowCache.getOrPut(id) {
+            combine(_currentVolumes, _activeSoundIds) { volumes, activeIds ->
+                SoundState(
+                    volume = volumes[id] ?: 0f,
+                    isActive = activeIds.contains(id)
+                )
+            }
+            .distinctUntilChanged()
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = SoundState(
+                    volume = _currentVolumes.value[id] ?: 0f,
+                    isActive = _activeSoundIds.value.contains(id)
+                )
+            )
+        }
+    }
 
     // High-Precision / Fine-Tuning State
     private val _highPrecisionSoundId = MutableStateFlow<String?>(null)
