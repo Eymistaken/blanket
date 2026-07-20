@@ -62,7 +62,7 @@ class AudioEngine(
     private val soundMetadata = ConcurrentHashMap<String, SoundMetadata>()
 
     // Map to hold pending debounce release jobs. Key is soundId.
-    private val releaseJobs = ConcurrentHashMap<String, Job>()
+    internal val releaseJobs = ConcurrentHashMap<String, Job>()
 
     private data class SoundMetadata(
         val isCustom: Boolean,
@@ -184,6 +184,16 @@ class AudioEngine(
             
             engineJob.cancel()
             audioThread.quitSafely()
+        }
+    }
+
+    internal fun sync() {
+        try {
+            val shadowsClass = Class.forName("org.robolectric.Shadows")
+            val method = shadowsClass.getMethod("shadowOf", android.os.Looper::class.java)
+            val shadow = method.invoke(null, handler.looper)
+            shadow?.javaClass?.getMethod("idle")?.invoke(shadow)
+        } catch (_: Throwable) {
         }
     }
 
