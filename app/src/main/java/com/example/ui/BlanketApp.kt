@@ -47,6 +47,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.example.R
 import com.example.audio.SoundType
 import com.example.data.Preset
@@ -54,6 +57,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -65,6 +69,37 @@ fun BlanketApp(viewModel: BlanketViewModel) {
     val sleepTimerTotalMs by viewModel.sleepTimerTotalMs.collectAsStateWithLifecycle()
     val presets by viewModel.presets.collectAsStateWithLifecycle()
     val highPrecisionSoundId by viewModel.highPrecisionSoundId.collectAsStateWithLifecycle()
+
+    val activeSoundsCount = activeSoundIds.size
+    val isHighLoad = activeSoundsCount >= 5
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isResumed by remember { mutableStateOf(true) }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            isResumed = event.targetState.isAtLeast(Lifecycle.State.RESUMED)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    val sharedTransition = rememberInfiniteTransition(label = "SharedAnimationTransition")
+    val sharedProgress by if (isResumed && !isHighLoad) {
+        sharedTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(3000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "SharedAnimationProgress"
+        )
+    } else {
+        remember { mutableStateOf(0f) }
+    }
 
     var showTimerDialog by remember { mutableStateOf(false) }
     var showPresetDialog by remember { mutableStateOf(false) }
@@ -172,7 +207,11 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                             )
                         )
                         if (isPlaying && activeSoundIds.isNotEmpty()) {
-                            AudioEqualizerAnimation(color = softTeal)
+                            AudioEqualizerAnimation(
+                                color = softTeal,
+                                sharedProgress = sharedProgress,
+                                isResumed = isResumed
+                            )
                         }
                     }
 
@@ -197,7 +236,10 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                                 activeColor = radiantIndigo,
                                 surfaceColor = indigoSurface,
                                 accentColor = softTeal,
-                                viewModel = viewModel
+                                viewModel = viewModel,
+                                sharedProgress = sharedProgress,
+                                isHighLoad = isHighLoad,
+                                isResumed = isResumed
                             )
                         }
 
@@ -653,7 +695,10 @@ fun SoundCard(
     activeColor: Color,
     surfaceColor: Color,
     accentColor: Color,
-    viewModel: BlanketViewModel
+    viewModel: BlanketViewModel,
+    sharedProgress: Float = 0f,
+    isHighLoad: Boolean = false,
+    isResumed: Boolean = true
 ) {
     val soundState by soundStateFlow.collectAsStateWithLifecycle()
     val volume = soundState.volume
@@ -669,28 +714,33 @@ fun SoundCard(
         }
     }
 
-    // Elastic spring animation for the background volume fill progress
+    // Adapt background volume animation based on system load (spring for normal, lightweight tween for high load)
+    val volumeAnimSpec: AnimationSpec<Float> = remember(isHighLoad) {
+        if (isHighLoad) {
+            tween(durationMillis = 120, easing = FastOutSlowInEasing)
+        } else {
+            spring(
+                dampingRatio = Spring.DampingRatioLowBouncy,
+                stiffness = Spring.StiffnessMediumLow
+            )
+        }
+    }
+
     val animatedVolume by animateFloatAsState(
         targetValue = localVolume,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioLowBouncy,
-            stiffness = Spring.StiffnessMediumLow
-        )
+        animationSpec = volumeAnimSpec
     )
 
-    // Gentle pulsating breath animation on active icons (optimized via graphicsLayer)
-    val infiniteTransition = rememberInfiniteTransition()
-    val pulseScale by if (isActive) {
-        infiniteTransition.animateFloat(
-            initialValue = 0.94f,
-            targetValue = 1.06f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(1500, easing = EaseInOutQuad),
-                repeatMode = RepeatMode.Reverse
-            )
-        )
-    } else {
-        remember { mutableStateOf(1.0f) }
+    // Gentle pulsating breath animation on active icons phase-shifted from single shared progress source
+    val pulseScale = remember(isActive, isHighLoad, isResumed, sharedProgress, soundItem.id) {
+        if (isActive && !isHighLoad && isResumed) {
+            val phase = (soundItem.id.hashCode() and 0x7FFFFFFF) % 100 / 100f
+            val shiftedProgress = (sharedProgress + phase) % 1f
+            val sineWave = sin(shiftedProgress * 2 * Math.PI.toFloat())
+            1.0f + sineWave * 0.06f
+        } else {
+            1.0f
+        }
     }
 
     val cardBackground = MaterialTheme.colorScheme.surfaceVariant
@@ -716,7 +766,7 @@ fun SoundCard(
             .fillMaxWidth()
             .height(130.dp)
             .shadow(
-                elevation = if (isActive) 8.dp else 0.dp,
+                elevation = if (isActive && !isHighLoad) 6.dp else 0.dp,
                 shape = RoundedCornerShape(28.dp),
                 spotColor = MaterialTheme.colorScheme.primary
             )
@@ -984,33 +1034,14 @@ fun SoundCard(
 }
 
 @Composable
-fun AudioEqualizerAnimation(color: Color) {
-    val infiniteTransition = rememberInfiniteTransition()
-
-    val height1 by infiniteTransition.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 0.9f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(600, easing = EaseInOutQuad),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
-    val height2 by infiniteTransition.animateFloat(
-        initialValue = 0.4f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(450, easing = EaseInOutQuad),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
-    val height3 by infiniteTransition.animateFloat(
-        initialValue = 0.1f,
-        targetValue = 0.8f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(750, easing = EaseInOutQuad),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
+fun AudioEqualizerAnimation(
+    color: Color,
+    sharedProgress: Float = 0f,
+    isResumed: Boolean = true
+) {
+    val height1 = if (isResumed) 0.2f + 0.7f * (0.5f + 0.5f * sin((sharedProgress * 10f) * 2 * Math.PI.toFloat())) else 0.5f
+    val height2 = if (isResumed) 0.4f + 0.6f * (0.5f + 0.5f * sin((sharedProgress * 13.33f + 0.3f) * 2 * Math.PI.toFloat())) else 0.7f
+    val height3 = if (isResumed) 0.1f + 0.7f * (0.5f + 0.5f * sin((sharedProgress * 8f + 0.7f) * 2 * Math.PI.toFloat())) else 0.4f
 
     Row(
         verticalAlignment = Alignment.Bottom,
