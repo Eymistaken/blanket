@@ -751,6 +751,8 @@ fun SoundCard(
 
     val haptic = LocalHapticFeedback.current
     var lastTickType by remember { mutableStateOf(-1) } // -1 = none, 0 = 0.0, 1 = 0.5, 2 = 1.0
+    var lastHapticTime by remember { mutableLongStateOf(0L) }
+    var lastHapticVolume by remember { mutableFloatStateOf(0f) }
 
     // Capture state references without cancelling gesture scope
     val currentIsActive by rememberUpdatedState(isActive)
@@ -806,7 +808,7 @@ fun SoundCard(
                             else -> dragAccumulator
                         }
 
-                        // Haptic Trigger
+                        // Time-throttled snap point haptic trigger (max once per 50ms)
                         val currentTickType = when (snappedVal) {
                             0f -> 0
                             0.5f -> 1
@@ -814,7 +816,12 @@ fun SoundCard(
                             else -> -1
                         }
                         if (currentTickType != -1 && currentTickType != lastTickType) {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            val now = android.os.SystemClock.uptimeMillis()
+                            if (now - lastHapticTime >= 50L) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                lastHapticTime = now
+                                lastHapticVolume = snappedVal
+                            }
                         }
                         lastTickType = currentTickType
 
@@ -841,6 +848,8 @@ fun SoundCard(
                         }
                         // Start high-precision mode
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        lastHapticTime = android.os.SystemClock.uptimeMillis()
+                        lastHapticVolume = localVolume
                         viewModel.setHighPrecisionMode(soundItem.id, true)
                         fineDragAccumulator = localVolume
                     },
@@ -856,8 +865,16 @@ fun SoundCard(
                         val fineVol = (fineDragAccumulator * 100).roundToInt() / 100f
                         
                         if (fineVol != localVolume) {
-                            // TextHandleMove is a very short, crisp tick vibration!
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            val now = android.os.SystemClock.uptimeMillis()
+                            val volDelta = kotlin.math.abs(fineVol - lastHapticVolume)
+                            
+                            // Time-based throttling: trigger haptic at most once every 50ms OR on >= 5% (0.05f) volume step
+                            if (now - lastHapticTime >= 50L || volDelta >= 0.05f) {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                lastHapticTime = now
+                                lastHapticVolume = fineVol
+                            }
+
                             localVolume = fineVol
                             viewModel.setVolume(soundItem.id, fineVol, immediate = false)
                         }
