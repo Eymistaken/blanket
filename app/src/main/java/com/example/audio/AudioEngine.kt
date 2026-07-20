@@ -12,6 +12,12 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.example.R
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.android.asCoroutineDispatcher
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 enum class SoundType(val id: String, val label: String, val iconName: String) {
     RAIN("rain", "Yağmur", "umbrella"),
@@ -36,6 +42,10 @@ class AudioEngine(private val context: Context) {
     // Background thread dedicated to running all ExoPlayer instances and updates
     private val audioThread = HandlerThread("AudioEngineThread").apply { start() }
     private val handler = Handler(audioThread.looper)
+    private val engineJob = SupervisorJob()
+    private val engineDispatcher = handler.asCoroutineDispatcher("AudioEngineDispatcher")
+    private val engineScope = CoroutineScope(engineDispatcher + engineJob)
+
     private var isPlaying = false
 
     // Store sound volumes (0.0f to 1.0f). Key is soundId.
@@ -46,6 +56,9 @@ class AudioEngine(private val context: Context) {
 
     // Store metadata needed to initialize custom/built-in sounds lazily.
     private val soundMetadata = ConcurrentHashMap<String, SoundMetadata>()
+
+    // Map to hold pending debounce release jobs. Key is soundId.
+    private val releaseJobs = ConcurrentHashMap<String, Job>()
 
     private data class SoundMetadata(
         val isCustom: Boolean,
@@ -77,17 +90,35 @@ class AudioEngine(private val context: Context) {
 
         Log.d(TAG, "Volume set for $soundId: $coercedVolume")
 
-        handler.post {
-            if (isPlaying) {
-                if (coercedVolume > 0f) {
+        // Cancel pending release job for this soundId
+        releaseJobs.remove(soundId)?.cancel()
+
+        engineScope.launch {
+            if (coercedVolume > 0f) {
+                if (isPlaying) {
                     val player = getOrCreatePlayer(soundId)
                     player.volume = coercedVolume
                     if (!player.isPlaying) {
                         player.playWhenReady = true
                     }
                 } else {
-                    players[soundId]?.playWhenReady = false
+                    players[soundId]?.volume = coercedVolume
                 }
+            } else {
+                players[soundId]?.playWhenReady = false
+                
+                // Debounce release ExoPlayer after 2.5 seconds
+                val job = engineScope.launch {
+                    delay(2500L)
+                    if ((soundVolumes[soundId] ?: 0f) == 0f) {
+                        players.remove(soundId)?.let { player ->
+                            player.stop()
+                            player.release()
+                            Log.d(TAG, "Released ExoPlayer for $soundId after 2.5s debounce")
+                        }
+                    }
+                }
+                releaseJobs[soundId] = job
             }
         }
     }
@@ -106,9 +137,10 @@ class AudioEngine(private val context: Context) {
         isPlaying = true
         Log.d(TAG, "AudioEngine starting playing sounds...")
 
-        handler.post {
+        engineScope.launch {
             soundVolumes.forEach { (soundId, vol) ->
                 if (vol > 0f) {
+                    releaseJobs.remove(soundId)?.cancel()
                     val player = getOrCreatePlayer(soundId)
                     player.volume = vol
                     if (!player.isPlaying) {
@@ -125,7 +157,7 @@ class AudioEngine(private val context: Context) {
         isPlaying = false
         Log.d(TAG, "AudioEngine pausing playback...")
 
-        handler.post {
+        engineScope.launch {
             players.values.forEach { player ->
                 player.playWhenReady = false
             }
@@ -135,7 +167,9 @@ class AudioEngine(private val context: Context) {
     @Synchronized
     fun stop() {
         pause()
-        handler.post {
+        releaseJobs.values.forEach { it.cancel() }
+        releaseJobs.clear()
+        engineScope.launch {
             players.values.forEach { player ->
                 player.stop()
                 player.release()
@@ -144,9 +178,17 @@ class AudioEngine(private val context: Context) {
             soundVolumes.keys.forEach { soundVolumes[it] = 0f }
             Log.d(TAG, "AudioEngine stopped and resources released.")
             
-            // Clean up the background thread to prevent thread leaks
+            engineJob.cancel()
             audioThread.quitSafely()
         }
+    }
+
+    internal fun hasPlayer(soundId: String): Boolean {
+        return players.containsKey(soundId)
+    }
+
+    internal fun getActivePlayerCount(): Int {
+        return players.size
     }
 
     private fun getOrCreatePlayer(soundId: String): ExoPlayer {
@@ -157,6 +199,7 @@ class AudioEngine(private val context: Context) {
             } else {
                 Uri.parse("android.resource://${context.packageName}/${meta.rawResId}")
             }
+            Log.d(TAG, "Creating ExoPlayer lazily for sound: $soundId")
             ExoPlayer.Builder(context)
                 .setPlaybackLooper(audioThread.looper)
                 .build().apply {
