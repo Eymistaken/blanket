@@ -47,16 +47,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.example.R
 import com.example.audio.SoundType
 import com.example.data.Preset
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun BlanketApp(viewModel: BlanketViewModel) {
+fun BlanketApp(
+    viewModel: BlanketViewModel,
+    onRetryServiceBind: () -> Unit = {}
+) {
     val isPlaying by viewModel.isPlaying.collectAsStateWithLifecycle()
     val activeSoundIds by viewModel.activeSoundIds.collectAsStateWithLifecycle()
     val soundItems by viewModel.soundItems.collectAsStateWithLifecycle()
@@ -64,6 +72,67 @@ fun BlanketApp(viewModel: BlanketViewModel) {
     val sleepTimerTotalMs by viewModel.sleepTimerTotalMs.collectAsStateWithLifecycle()
     val presets by viewModel.presets.collectAsStateWithLifecycle()
     val highPrecisionSoundId by viewModel.highPrecisionSoundId.collectAsStateWithLifecycle()
+    val serviceBindError by viewModel.serviceBindError.collectAsStateWithLifecycle()
+    val userMessage by viewModel.userMessage.collectAsStateWithLifecycle()
+    val pendingImport by viewModel.pendingImport.collectAsStateWithLifecycle()
+
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(serviceBindError) {
+        val errorMsg = serviceBindError
+        if (errorMsg != null) {
+            val result = snackbarHostState.showSnackbar(
+                message = errorMsg,
+                actionLabel = "Tekrar Dene",
+                duration = SnackbarDuration.Indefinite
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                onRetryServiceBind()
+            }
+        }
+    }
+
+    LaunchedEffect(userMessage) {
+        val msg = userMessage
+        if (msg != null) {
+            snackbarHostState.showSnackbar(
+                message = msg,
+                duration = SnackbarDuration.Short
+            )
+            viewModel.clearUserMessage()
+        }
+    }
+
+    val activeSoundsCount = activeSoundIds.size
+    val isHighLoad = activeSoundsCount >= 5
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isResumed by remember { mutableStateOf(true) }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            isResumed = event.targetState.isAtLeast(Lifecycle.State.RESUMED)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    val sharedTransition = rememberInfiniteTransition(label = "SharedAnimationTransition")
+    val sharedProgress by if (isResumed && !isHighLoad) {
+        sharedTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(3000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "SharedAnimationProgress"
+        )
+    } else {
+        remember { mutableStateOf(0f) }
+    }
 
     var showTimerDialog by remember { mutableStateOf(false) }
     var showPresetDialog by remember { mutableStateOf(false) }
@@ -87,6 +156,7 @@ fun BlanketApp(viewModel: BlanketViewModel) {
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
+        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         topBar = {
             CenterAlignedTopAppBar(
                 title = {
@@ -171,7 +241,11 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                             )
                         )
                         if (isPlaying && activeSoundIds.isNotEmpty()) {
-                            AudioEqualizerAnimation(color = softTeal)
+                            AudioEqualizerAnimation(
+                                color = softTeal,
+                                sharedProgress = sharedProgress,
+                                isResumed = isResumed
+                            )
                         }
                     }
 
@@ -185,20 +259,21 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                         modifier = Modifier.weight(1f)
                     ) {
                         items(soundItems, key = { it.id }) { soundItem ->
-                            val isActive = activeSoundIds.contains(soundItem.id)
-                            val volumeFlow = remember(soundItem.id) {
-                                viewModel.currentVolumes.map { it[soundItem.id] ?: 0f }.distinctUntilChanged()
+                            val soundStateFlow = remember(soundItem.id) {
+                                viewModel.soundState(soundItem.id)
                             }
                             SoundCard(
                                 soundItem = soundItem,
-                                isActive = isActive,
-                                volumeFlow = volumeFlow,
+                                soundStateFlow = soundStateFlow,
                                 onVolumeChange = { vol -> viewModel.setVolume(soundItem.id, vol) },
                                 onToggleActive = { viewModel.toggleSoundActive(soundItem.id) },
                                 activeColor = radiantIndigo,
                                 surfaceColor = indigoSurface,
                                 accentColor = softTeal,
-                                viewModel = viewModel
+                                viewModel = viewModel,
+                                sharedProgress = sharedProgress,
+                                isHighLoad = isHighLoad,
+                                isResumed = isResumed
                             )
                         }
 
@@ -301,6 +376,41 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                 )
             }
 
+            // Option B Overwrite Confirmation Dialog for Custom Sound Import
+            if (pendingImport != null) {
+                AlertDialog(
+                    onDismissRequest = { viewModel.cancelImport() },
+                    title = {
+                        Text(
+                            text = "Dosya Zaten Var",
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    },
+                    text = {
+                        Text(
+                            text = "'${pendingImport?.cleanName}' isimli özel ses zaten mevcut. Üzerine yazmak istediğinize emin misiniz?",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { viewModel.confirmOverwriteImport() }) {
+                            Text(
+                                text = "Üzerine Yaz",
+                                color = MaterialTheme.colorScheme.error,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { viewModel.cancelImport() }) {
+                            Text(text = "İptal")
+                        }
+                    },
+                    containerColor = MaterialTheme.colorScheme.surface
+                )
+            }
+
             // High-precision Dim Background Overlay
             AnimatedVisibility(
                 visible = highPrecisionSoundId != null,
@@ -332,7 +442,7 @@ fun BlanketApp(viewModel: BlanketViewModel) {
                 val volumeFlow = remember(soundId) {
                     viewModel.currentVolumes.map { it[soundId] ?: 0f }.distinctUntilChanged()
                 }
-                val volume by volumeFlow.collectAsState(initial = 0f)
+                val volume by volumeFlow.collectAsState(initial = viewModel.currentVolumes.value[soundId] ?: 0f)
 
                 // Smooth spring progress inside overlay
                 val overlayAnimatedVolume by animateFloatAsState(
@@ -648,16 +758,20 @@ fun MasterControlPanel(
 @Composable
 fun SoundCard(
     soundItem: SoundItem,
-    isActive: Boolean,
-    volumeFlow: kotlinx.coroutines.flow.Flow<Float>,
+    soundStateFlow: StateFlow<SoundState>,
     onVolumeChange: (Float) -> Unit,
     onToggleActive: () -> Unit,
     activeColor: Color,
     surfaceColor: Color,
     accentColor: Color,
-    viewModel: BlanketViewModel
+    viewModel: BlanketViewModel,
+    sharedProgress: Float = 0f,
+    isHighLoad: Boolean = false,
+    isResumed: Boolean = true
 ) {
-    val volume by volumeFlow.collectAsState(initial = 0f)
+    val soundState by soundStateFlow.collectAsStateWithLifecycle()
+    val volume = soundState.volume
+    val isActive = soundState.isActive
     var cardWidth by remember { mutableStateOf(1) }
 
     var localVolume by remember { mutableFloatStateOf(0f) }
@@ -669,28 +783,33 @@ fun SoundCard(
         }
     }
 
-    // Elastic spring animation for the background volume fill progress
+    // Adapt background volume animation based on system load (spring for normal, lightweight tween for high load)
+    val volumeAnimSpec: AnimationSpec<Float> = remember(isHighLoad) {
+        if (isHighLoad) {
+            tween(durationMillis = 120, easing = FastOutSlowInEasing)
+        } else {
+            spring(
+                dampingRatio = Spring.DampingRatioLowBouncy,
+                stiffness = Spring.StiffnessMediumLow
+            )
+        }
+    }
+
     val animatedVolume by animateFloatAsState(
         targetValue = localVolume,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioLowBouncy,
-            stiffness = Spring.StiffnessMediumLow
-        )
+        animationSpec = volumeAnimSpec
     )
 
-    // Gentle pulsating breath animation on active icons (optimized via graphicsLayer)
-    val infiniteTransition = rememberInfiniteTransition()
-    val pulseScale by if (isActive) {
-        infiniteTransition.animateFloat(
-            initialValue = 0.94f,
-            targetValue = 1.06f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(1500, easing = EaseInOutQuad),
-                repeatMode = RepeatMode.Reverse
-            )
-        )
-    } else {
-        remember { mutableStateOf(1.0f) }
+    // Gentle pulsating breath animation on active icons phase-shifted from single shared progress source
+    val pulseScale = remember(isActive, isHighLoad, isResumed, sharedProgress, soundItem.id) {
+        if (isActive && !isHighLoad && isResumed) {
+            val phase = (soundItem.id.hashCode() and 0x7FFFFFFF) % 100 / 100f
+            val shiftedProgress = (sharedProgress + phase) % 1f
+            val sineWave = sin(shiftedProgress * 2 * Math.PI.toFloat())
+            1.0f + sineWave * 0.06f
+        } else {
+            1.0f
+        }
     }
 
     val cardBackground = MaterialTheme.colorScheme.surfaceVariant
@@ -701,6 +820,8 @@ fun SoundCard(
 
     val haptic = LocalHapticFeedback.current
     var lastTickType by remember { mutableStateOf(-1) } // -1 = none, 0 = 0.0, 1 = 0.5, 2 = 1.0
+    var lastHapticTime by remember { mutableLongStateOf(0L) }
+    var lastHapticVolume by remember { mutableFloatStateOf(0f) }
 
     // Capture state references without cancelling gesture scope
     val currentIsActive by rememberUpdatedState(isActive)
@@ -716,7 +837,7 @@ fun SoundCard(
             .fillMaxWidth()
             .height(130.dp)
             .shadow(
-                elevation = if (isActive) 8.dp else 0.dp,
+                elevation = if (isActive && !isHighLoad) 6.dp else 0.dp,
                 shape = RoundedCornerShape(28.dp),
                 spotColor = MaterialTheme.colorScheme.primary
             )
@@ -729,16 +850,19 @@ fun SoundCard(
                     onDragStart = {
                         isDragging = true
                         // Auto-activate card if dragged while inactive
-                        if (!currentIsActive) {
-                            currentOnToggleActive()
+                        if (!viewModel.activeSoundIds.value.contains(soundItem.id)) {
+                            viewModel.toggleSoundActive(soundItem.id)
+                            localVolume = viewModel.currentVolumes.value[soundItem.id] ?: 0.5f
                         }
                         dragAccumulator = localVolume
                     },
                     onHorizontalDrag = { change, dragAmount ->
                         change.consume()
                         // Ensure card is active
-                        if (!currentIsActive) {
-                            currentOnToggleActive()
+                        if (!viewModel.activeSoundIds.value.contains(soundItem.id)) {
+                            viewModel.toggleSoundActive(soundItem.id)
+                            localVolume = viewModel.currentVolumes.value[soundItem.id] ?: 0.5f
+                            dragAccumulator = localVolume
                         }
                         
                         // Relative delta-based dragging with 1.8f sensitivity factor
@@ -753,7 +877,7 @@ fun SoundCard(
                             else -> dragAccumulator
                         }
 
-                        // Haptic Trigger
+                        // Time-throttled snap point haptic trigger (max once per 50ms)
                         val currentTickType = when (snappedVal) {
                             0f -> 0
                             0.5f -> 1
@@ -761,7 +885,12 @@ fun SoundCard(
                             else -> -1
                         }
                         if (currentTickType != -1 && currentTickType != lastTickType) {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            val now = android.os.SystemClock.uptimeMillis()
+                            if (now - lastHapticTime >= 50L) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                lastHapticTime = now
+                                lastHapticVolume = snappedVal
+                            }
                         }
                         lastTickType = currentTickType
 
@@ -782,11 +911,14 @@ fun SoundCard(
                 detectDragGesturesAfterLongPress(
                     onDragStart = {
                         isDragging = true
-                        if (!currentIsActive) {
-                            currentOnToggleActive()
+                        if (!viewModel.activeSoundIds.value.contains(soundItem.id)) {
+                            viewModel.toggleSoundActive(soundItem.id)
+                            localVolume = viewModel.currentVolumes.value[soundItem.id] ?: 0.5f
                         }
                         // Start high-precision mode
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        lastHapticTime = android.os.SystemClock.uptimeMillis()
+                        lastHapticVolume = localVolume
                         viewModel.setHighPrecisionMode(soundItem.id, true)
                         fineDragAccumulator = localVolume
                     },
@@ -802,8 +934,16 @@ fun SoundCard(
                         val fineVol = (fineDragAccumulator * 100).roundToInt() / 100f
                         
                         if (fineVol != localVolume) {
-                            // TextHandleMove is a very short, crisp tick vibration!
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            val now = android.os.SystemClock.uptimeMillis()
+                            val volDelta = kotlin.math.abs(fineVol - lastHapticVolume)
+                            
+                            // Time-based throttling: trigger haptic at most once every 50ms OR on >= 5% (0.05f) volume step
+                            if (now - lastHapticTime >= 50L || volDelta >= 0.05f) {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                lastHapticTime = now
+                                lastHapticVolume = fineVol
+                            }
+
                             localVolume = fineVol
                             viewModel.setVolume(soundItem.id, fineVol, immediate = false)
                         }
@@ -980,33 +1120,14 @@ fun SoundCard(
 }
 
 @Composable
-fun AudioEqualizerAnimation(color: Color) {
-    val infiniteTransition = rememberInfiniteTransition()
-
-    val height1 by infiniteTransition.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 0.9f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(600, easing = EaseInOutQuad),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
-    val height2 by infiniteTransition.animateFloat(
-        initialValue = 0.4f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(450, easing = EaseInOutQuad),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
-    val height3 by infiniteTransition.animateFloat(
-        initialValue = 0.1f,
-        targetValue = 0.8f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(750, easing = EaseInOutQuad),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
+fun AudioEqualizerAnimation(
+    color: Color,
+    sharedProgress: Float = 0f,
+    isResumed: Boolean = true
+) {
+    val height1 = if (isResumed) 0.2f + 0.7f * (0.5f + 0.5f * sin((sharedProgress * 10f) * 2 * Math.PI.toFloat())) else 0.5f
+    val height2 = if (isResumed) 0.4f + 0.6f * (0.5f + 0.5f * sin((sharedProgress * 13.33f + 0.3f) * 2 * Math.PI.toFloat())) else 0.7f
+    val height3 = if (isResumed) 0.1f + 0.7f * (0.5f + 0.5f * sin((sharedProgress * 8f + 0.7f) * 2 * Math.PI.toFloat())) else 0.4f
 
     Row(
         verticalAlignment = Alignment.Bottom,

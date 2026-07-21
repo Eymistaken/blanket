@@ -15,14 +15,30 @@ import com.example.audio.SoundType
 import com.example.data.Preset
 import com.example.data.PresetRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+
+data class SoundState(
+    val volume: Float = 0f,
+    val isActive: Boolean = false
+)
+
+data class PendingImport(
+    val uri: Uri,
+    val destFile: File,
+    val cleanName: String,
+    val newSoundId: String
+)
 
 data class SoundItem(
     val id: String,
@@ -31,6 +47,12 @@ data class SoundItem(
     val isCustom: Boolean = false,
     val filePath: String? = null,
     val rawResId: Int? = null
+)
+
+private data class SoundVolumeIntent(
+    val soundId: String,
+    val volume: Float,
+    val immediate: Boolean
 )
 
 val BuiltInSounds = listOf(
@@ -74,6 +96,53 @@ class BlanketViewModel(
     private val _activeSoundIds = MutableStateFlow<Set<String>>(emptySet())
     val activeSoundIds: StateFlow<Set<String>> = _activeSoundIds.asStateFlow()
 
+    // Service Binding Error State
+    private val _serviceBindError = MutableStateFlow<String?>(null)
+    val serviceBindError: StateFlow<String?> = _serviceBindError.asStateFlow()
+
+    // Pending Import Overwrite State (Option B)
+    private val _pendingImport = MutableStateFlow<PendingImport?>(null)
+    val pendingImport: StateFlow<PendingImport?> = _pendingImport.asStateFlow()
+
+    // General User Message State (for Snackbar feedback)
+    private val _userMessage = MutableStateFlow<String?>(null)
+    val userMessage: StateFlow<String?> = _userMessage.asStateFlow()
+
+    fun setServiceBindError(error: String?) {
+        _serviceBindError.value = error
+    }
+
+    fun clearServiceBindError() {
+        _serviceBindError.value = null
+    }
+
+    fun clearUserMessage() {
+        _userMessage.value = null
+    }
+
+    // Scoped per-sound state flow cache to isolate recompositions
+    private val soundStateFlowCache = ConcurrentHashMap<String, StateFlow<SoundState>>()
+
+    fun soundState(id: String): StateFlow<SoundState> {
+        return soundStateFlowCache.getOrPut(id) {
+            combine(_currentVolumes, _activeSoundIds) { volumes, activeIds ->
+                SoundState(
+                    volume = volumes[id] ?: 0f,
+                    isActive = activeIds.contains(id)
+                )
+            }
+            .distinctUntilChanged()
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = SoundState(
+                    volume = _currentVolumes.value[id] ?: 0f,
+                    isActive = _activeSoundIds.value.contains(id)
+                )
+            )
+        }
+    }
+
     // High-Precision / Fine-Tuning State
     private val _highPrecisionSoundId = MutableStateFlow<String?>(null)
     val highPrecisionSoundId: StateFlow<String?> = _highPrecisionSoundId.asStateFlow()
@@ -81,6 +150,9 @@ class BlanketViewModel(
     // Available sounds list (built-in + scanned custom sounds)
     private val _soundItems = MutableStateFlow<List<SoundItem>>(BuiltInSounds)
     val soundItems: StateFlow<List<SoundItem>> = _soundItems.asStateFlow()
+
+    // Volume intent flow for throttling/sampling volume changes during drag gestures
+    private val volumeIntentFlow = MutableSharedFlow<SoundVolumeIntent>(extraBufferCapacity = 128)
 
     // Store the last non-zero volume for each sound ID
     private val lastVolumes = ConcurrentHashMap<String, Float>().apply {
@@ -104,6 +176,18 @@ class BlanketViewModel(
 
     init {
         loadCustomSounds()
+        setupVolumeThrottling()
+    }
+
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    private fun setupVolumeThrottling() {
+        viewModelScope.launch(Dispatchers.Default) {
+            volumeIntentFlow
+                .sample(120L)
+                .collect { intent ->
+                    applyVolumeInternal(intent.soundId, intent.volume, immediate = false)
+                }
+        }
     }
 
     fun loadCustomSounds(onComplete: (() -> Unit)? = null) {
@@ -149,6 +233,7 @@ class BlanketViewModel(
             if (binder != null) {
                 boundService = binder.getService()
                 _isServiceConnected.value = true
+                clearServiceBindError()
 
                 // Attach real-time listener
                 boundService?.setListener(object : BlanketAudioService.Listener {
@@ -161,14 +246,9 @@ class BlanketViewModel(
                         }
                         _currentVolumes.value = fullMap
                         
-                        // Sync activeSoundIds: if it has volume > 0f, it is definitely active
-                        val activeFromVolume = volumes.filter { it.value > 0f }.keys
-                        if (activeFromVolume.isNotEmpty()) {
-                            val mergedActive = _activeSoundIds.value.toMutableSet().apply {
-                                addAll(activeFromVolume)
-                            }
-                            _activeSoundIds.value = mergedActive
-                        }
+                        // Sync activeSoundIds: exact set of sounds with volume > 0f (symmetrical add and remove)
+                        val activeFromVolume = volumes.filter { it.value > 0f }.keys.toSet()
+                        _activeSoundIds.value = activeFromVolume
 
                         // Save playback state whenever it changes
                         savePlaybackState()
@@ -265,19 +345,18 @@ class BlanketViewModel(
     }
 
     fun stopAll() {
-        val service = boundService ?: return
-        val updatedVolumes = _currentVolumes.value.toMutableMap()
-        _soundItems.value.forEach { sound ->
-            service.audioEngine.setVolume(sound.id, 0f)
-            updatedVolumes[sound.id] = 0f
-        }
-        _currentVolumes.value = updatedVolumes
+        val service = boundService
+        val fullZeroMap = _soundItems.value.associate { it.id to 0f }
+        _currentVolumes.value = fullZeroMap
         _activeSoundIds.value = emptySet()
-        service.updateVolumesAndActiveState(immediate = true)
-        service.pausePlayback()
+        _isPlaying.value = false
+
+        if (service != null) {
+            service.stopPlayback()
+        }
     }
 
-    fun setVolume(soundId: String, volume: Float, immediate: Boolean = false) {
+    private fun applyVolumeInternal(soundId: String, volume: Float, immediate: Boolean) {
         val service = boundService ?: return
         val sound = _soundItems.value.find { it.id == soundId } ?: return
 
@@ -289,7 +368,6 @@ class BlanketViewModel(
             rawResId = sound.rawResId
         )
 
-        // Instantly update ViewModel state maps so UI reacts in real-time without latency
         val updatedVolumes = _currentVolumes.value.toMutableMap()
         updatedVolumes[soundId] = volume
         _currentVolumes.value = updatedVolumes
@@ -309,9 +387,18 @@ class BlanketViewModel(
             lastVolumes[soundId] = volume
         }
 
-        // If master is paused and volume is > 0f, start playback automatically
         if (!_isPlaying.value && volume > 0f) {
             service.startPlayback()
+        }
+    }
+
+    fun setVolume(soundId: String, volume: Float, immediate: Boolean = false) {
+        if (immediate) {
+            viewModelScope.launch(Dispatchers.Default) {
+                applyVolumeInternal(soundId, volume, immediate = true)
+            }
+        } else {
+            volumeIntentFlow.tryEmit(SoundVolumeIntent(soundId, volume, immediate = false))
         }
     }
 
@@ -375,7 +462,7 @@ class BlanketViewModel(
                 val extension = originalName.substringAfterLast('.', "").lowercase()
                 val validExtensions = setOf("ogg", "opus", "mp3", "m4a")
                 if (extension !in validExtensions) {
-                    Log.e(TAG, "Unsupported file format: $extension")
+                    _userMessage.value = "Desteklenmeyen dosya biçimi: .$extension (Yalnızca OGG, MP3, M4A, OPUS yüklenebilir)."
                     return@launch
                 }
 
@@ -384,25 +471,51 @@ class BlanketViewModel(
                     customSoundsDir.mkdirs()
                 }
 
-                // Clean name for storage
-                val cleanName = originalName.substringBeforeLast('.')
-                    .replace(Regex("[^a-zA-Z0-9]"), "_") + "." + extension
+                val cleanBase = originalName.substringBeforeLast('.').replace(Regex("[^a-zA-Z0-9]"), "_")
+                val cleanName = "$cleanBase.$extension"
                 val destFile = File(customSoundsDir, cleanName)
+                val newSoundId = "custom_${cleanBase.lowercase()}"
 
-                applicationContext.contentResolver.openInputStream(uri)?.use { inputStream ->
-                    destFile.outputStream().use { outputStream ->
-                        inputStream.copyTo(outputStream)
-                    }
+                val pending = PendingImport(uri, destFile, cleanName, newSoundId)
+
+                if (destFile.exists()) {
+                    // Trigger Option B confirmation dialog
+                    _pendingImport.value = pending
+                } else {
+                    executeImport(pending)
                 }
-
-                val newSoundId = "custom_${cleanName.substringBeforeLast('.').lowercase()}"
-                lastVolumes[newSoundId] = 0.5f
-
-                // Reload custom list
-                loadCustomSounds()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to import sound", e)
+                _userMessage.value = "Ses içe aktarılırken bir hata oluştu."
             }
+        }
+    }
+
+    fun confirmOverwriteImport() {
+        val pending = _pendingImport.value ?: return
+        _pendingImport.value = null
+        viewModelScope.launch(Dispatchers.IO) {
+            executeImport(pending)
+        }
+    }
+
+    fun cancelImport() {
+        _pendingImport.value = null
+    }
+
+    private fun executeImport(pending: PendingImport) {
+        try {
+            applicationContext.contentResolver.openInputStream(pending.uri)?.use { inputStream ->
+                pending.destFile.outputStream().use { outputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+
+            lastVolumes[pending.newSoundId] = 0.5f
+            loadCustomSounds()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to execute import for ${pending.cleanName}", e)
+            _userMessage.value = "Dosya kaydedilirken hata oluştu."
         }
     }
 
