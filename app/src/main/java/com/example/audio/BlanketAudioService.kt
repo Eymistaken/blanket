@@ -7,14 +7,17 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import kotlinx.coroutines.*
 
@@ -176,6 +179,7 @@ class BlanketAudioService : Service() {
         isPlaying = true
         audioEngine.start()
         mediaSession?.isActive = true
+        updatePlaybackState()
         startForeground(NOTIFICATION_ID, buildNotification())
         notifyStateChange()
     }
@@ -185,6 +189,7 @@ class BlanketAudioService : Service() {
         isPlaying = false
         audioEngine.pause()
         releaseAudioFocus()
+        updatePlaybackState()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_DETACH)
         } else {
@@ -201,7 +206,15 @@ class BlanketAudioService : Service() {
         releaseAudioFocus()
         cancelSleepTimer()
         notifyStateChange(forcedVolumes = emptyMap())
-        stopForeground(true)
+        mediaSession?.isActive = false
+        updatePlaybackState()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            stopForeground(true)
+        }
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancel(NOTIFICATION_ID)
         stopSelf()
     }
 
@@ -277,6 +290,43 @@ class BlanketAudioService : Service() {
         serviceListener?.onTimerTick(sleepTimerRemainingMs, sleepTimerTotalMs)
     }
 
+    // Publishes a minimal playback state so the system renders this as a real media
+    // notification. Position is intentionally left as UNKNOWN and no duration metadata
+    // is set, so the media notification never shows a progress/seek bar.
+    private fun updatePlaybackState() {
+        val state = if (isPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
+        val playbackState = PlaybackState.Builder()
+            .setActions(
+                PlaybackState.ACTION_PLAY or
+                    PlaybackState.ACTION_PAUSE or
+                    PlaybackState.ACTION_PLAY_PAUSE or
+                    PlaybackState.ACTION_STOP
+            )
+            .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+            .build()
+        mediaSession?.setPlaybackState(playbackState)
+    }
+
+    private val appIconBitmap: Bitmap? by lazy {
+        try {
+            val drawable = packageManager.getApplicationIcon(packageName)
+            if (drawable is BitmapDrawable) {
+                drawable.bitmap
+            } else {
+                val width = drawable.intrinsicWidth.takeIf { it > 0 } ?: 128
+                val height = drawable.intrinsicHeight.takeIf { it > 0 } ?: 128
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bitmap)
+                drawable.setBounds(0, 0, canvas.width, canvas.height)
+                drawable.draw(canvas)
+                bitmap
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load app icon for notification", e)
+            null
+        }
+    }
+
     private fun buildNotification(): Notification {
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -309,9 +359,9 @@ class BlanketAudioService : Service() {
         val contentText = if (activeSoundLabels.isEmpty()) {
             "Aktif ses yok"
         } else if (activeSoundLabels.size <= 3) {
-            "Çalınıyor: " + activeSoundLabels.joinToString(", ")
+            activeSoundLabels.joinToString(", ")
         } else {
-            "Çalınıyor: " + activeSoundLabels.take(3).joinToString(", ") + " ve ${activeSoundLabels.size - 3} daha"
+            activeSoundLabels.take(3).joinToString(", ") + " ve ${activeSoundLabels.size - 3} daha"
         }
 
         val toggleIcon = if (isPlaying) {
@@ -321,17 +371,42 @@ class BlanketAudioService : Service() {
         }
         val toggleLabel = if (isPlaying) "Duraklat" else "Oynat"
 
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+        val toggleAction = Notification.Action.Builder(
+            android.graphics.drawable.Icon.createWithResource(this, toggleIcon),
+            toggleLabel,
+            togglePendingIntent
+        ).build()
+
+        val stopAction = Notification.Action.Builder(
+            android.graphics.drawable.Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+            "Durdur",
+            stopPendingIntent
+        ).build()
+
+        val mediaStyle = Notification.MediaStyle()
+            .setShowActionsInCompactView(0, 1)
+        mediaSession?.sessionToken?.let { mediaStyle.setMediaSession(it) }
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+
+        builder
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle("Blanket")
             .setContentText(contentText)
             .setContentIntent(openPendingIntent)
             .setOngoing(isPlaying)
             .setShowWhen(false)
-            .addAction(toggleIcon, toggleLabel, togglePendingIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Durdur", stopPendingIntent)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setStyle(mediaStyle)
+            .setActions(toggleAction, stopAction)
+            .setCategory(Notification.CATEGORY_TRANSPORT)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+
+        appIconBitmap?.let { builder.setLargeIcon(it) }
 
         return builder.build()
     }
@@ -353,14 +428,18 @@ class BlanketAudioService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         Log.d(TAG, "onTaskRemoved - swiped away. Stopping audio and service.")
+        isPlaying = false
         audioEngine.stop()
         releaseAudioFocus()
         cancelSleepTimer()
+        mediaSession?.isActive = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
             stopForeground(true)
         }
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancel(NOTIFICATION_ID)
         stopSelf()
         super.onTaskRemoved(rootIntent)
     }
